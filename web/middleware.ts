@@ -14,6 +14,8 @@ const PUBLIC_PATHS = [
   // Public share links: tokenized, unauthenticated.
   "/s",
   "/api/share",
+  // Hermes lab (Track 2): unauthenticated, sandboxed, no production data.
+  "/lab",
 ];
 
 // Lightweight gate. The cookie's mere presence is enough to let traffic through;
