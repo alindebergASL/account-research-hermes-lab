@@ -31,6 +31,9 @@ export function applyAction(canvas: Canvas, action: HermesAction): ApplyResult {
       if (canvas.widgets.some((w) => w.id === widget.id)) {
         return { ok: false, error: `widget id ${widget.id} already exists` };
       }
+      if (widget.idem_key && canvas.widgets.some((w) => w.idem_key === widget.idem_key)) {
+        return { ok: false, error: `widget with idem_key ${widget.idem_key} already exists` };
+      }
       return {
         ok: true,
         previous,

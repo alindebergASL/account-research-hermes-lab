@@ -110,6 +110,11 @@ export type SectionRefData = z.infer<typeof SectionRefData>;
 // Discriminated widget union by kind
 const WidgetBase = {
   id: z.string().min(1),
+  // Optional idempotency key. When two append_widget actions carry the same
+  // `idem_key`, the reducer treats the second as a no-op rather than appending
+  // a duplicate. Lets Hermes safely retry a flaky proposal without producing
+  // duplicate tiles.
+  idem_key: z.string().min(1).optional(),
   title: z.string().min(1),
   description: z.string().default(""),
   source: WidgetSource,

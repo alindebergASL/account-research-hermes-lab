@@ -12,11 +12,12 @@ import {
   propose as proposeAction,
   reject as rejectAction,
   resetDemo as resetStore,
+  retry as retryAction,
   saveState,
   undo as undoAction,
 } from "@/lib/canvas/store";
 import { getDescriptor } from "@/lib/canvas/registry";
-import { buildProposal, FakeHermesPromptId } from "@/lib/canvas/fakeHermes";
+import { buildProposal, FakeHermesPromptId, isBuildProposalError } from "@/lib/canvas/fakeHermes";
 import type { CanvasWidget } from "@/lib/canvas/schema";
 import type { Canvas } from "@/lib/canvas/schema";
 
@@ -76,8 +77,8 @@ export default function CanvasView() {
     (id: FakeHermesPromptId) => {
       if (!state) return;
       const draft = buildProposal(id, state.canvas);
-      if ("error" in draft) {
-        setToast(draft.error);
+      if (isBuildProposalError(draft)) {
+        setToast(draft.__error);
         return;
       }
       const result = proposeAction(state, draft);
@@ -133,6 +134,20 @@ export default function CanvasView() {
       setToast("Undone");
     },
     [state, clearUndo],
+  );
+
+  const handleRetry = useCallback(
+    (id: string) => {
+      if (!state) return;
+      const r = retryAction(state, id);
+      if (!r.ok) {
+        setToast(`Retry failed: ${r.error}`);
+        return;
+      }
+      setState(r.state);
+      setToast("Retry queued");
+    },
+    [state],
   );
 
   const handleReset = useCallback(() => {
@@ -197,6 +212,7 @@ export default function CanvasView() {
             onApprove={handleApprove}
             onReject={handleReject}
             onUndo={handleUndo}
+            onRetry={handleRetry}
             undoableId={undoableId}
             undoSecondsLeft={undoSecondsLeft}
           />

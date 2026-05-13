@@ -5,8 +5,10 @@ import type { HermesAction } from "@/lib/canvas/actions";
 
 const STATE_BADGE: Record<HermesAction["state"], string> = {
   proposed: "bg-amber-100 text-amber-800",
+  applying: "bg-sky-100 text-sky-800",
   auto_applied: "bg-emerald-100 text-emerald-800",
   applied: "bg-emerald-100 text-emerald-800",
+  failed: "bg-red-100 text-red-800",
   rejected: "bg-gray-200 text-gray-700",
   expired: "bg-gray-100 text-gray-500",
   undone: "bg-gray-200 text-gray-700",
@@ -26,6 +28,7 @@ export default function ActionQueue({
   onApprove,
   onReject,
   onUndo,
+  onRetry,
   undoableId,
   undoSecondsLeft,
 }: {
@@ -33,13 +36,15 @@ export default function ActionQueue({
   onApprove: (id: string) => void;
   onReject: (id: string, reason: string) => void;
   onUndo: (id: string) => void;
+  onRetry: (id: string) => void;
   undoableId: string | null;
   undoSecondsLeft: number;
 }) {
-  const [filter, setFilter] = useState<"all" | "needs_approval" | "auto" | "rejected">("all");
+  const [filter, setFilter] = useState<"all" | "needs_approval" | "auto" | "failed" | "rejected">("all");
   const filtered = actions.filter((a) => {
     if (filter === "needs_approval") return a.state === "proposed";
     if (filter === "auto") return a.state === "auto_applied";
+    if (filter === "failed") return a.state === "failed";
     if (filter === "rejected") return a.state === "rejected" || a.state === "undone";
     return true;
   });
@@ -51,7 +56,7 @@ export default function ActionQueue({
         <span className="text-xs text-muted">{actions.filter((a) => a.state === "proposed").length} pending</span>
       </div>
       <div className="flex gap-1 mb-3 flex-wrap">
-        {(["all", "needs_approval", "auto", "rejected"] as const).map((f) => (
+        {(["all", "needs_approval", "auto", "failed", "rejected"] as const).map((f) => (
           <button
             key={f}
             onClick={() => setFilter(f)}
@@ -70,7 +75,7 @@ export default function ActionQueue({
           filtered
             .slice()
             .reverse()
-            .map((a) => <ActionRow key={a.id} action={a} onApprove={onApprove} onReject={onReject} onUndo={onUndo} undoableId={undoableId} undoSecondsLeft={undoSecondsLeft} />)
+            .map((a) => <ActionRow key={a.id} action={a} onApprove={onApprove} onReject={onReject} onUndo={onUndo} onRetry={onRetry} undoableId={undoableId} undoSecondsLeft={undoSecondsLeft} />)
         )}
       </div>
     </div>
@@ -82,6 +87,7 @@ function ActionRow({
   onApprove,
   onReject,
   onUndo,
+  onRetry,
   undoableId,
   undoSecondsLeft,
 }: {
@@ -89,6 +95,7 @@ function ActionRow({
   onApprove: (id: string) => void;
   onReject: (id: string, reason: string) => void;
   onUndo: (id: string) => void;
+  onRetry: (id: string) => void;
   undoableId: string | null;
   undoSecondsLeft: number;
 }) {
@@ -116,6 +123,12 @@ function ActionRow({
       )}
       {action.reject_reason ? (
         <div className="text-xs text-red-700 mt-1">Rejected: {action.reject_reason}</div>
+      ) : null}
+      {action.error ? (
+        <div className="text-xs text-red-700 mt-1">Error: {action.error}</div>
+      ) : null}
+      {action.retry_of ? (
+        <div className="text-[10px] text-muted mt-1">retry of {action.retry_of}</div>
       ) : null}
 
       {action.state === "proposed" ? (
@@ -169,6 +182,25 @@ function ActionRow({
             className="text-xs px-3 py-1 rounded bg-ink text-white hover:opacity-90"
           >
             Undo ({undoSecondsLeft}s)
+          </button>
+        </div>
+      ) : null}
+
+      {action.state === "failed" ? (
+        <div className="mt-2 flex gap-2">
+          <button
+            data-testid="retry"
+            onClick={() => onRetry(action.id)}
+            className="text-xs px-3 py-1 rounded bg-amber-600 text-white hover:bg-amber-700"
+          >
+            Retry
+          </button>
+          <button
+            data-testid="discard"
+            onClick={() => onReject(action.id, "discarded after failure")}
+            className="text-xs px-3 py-1 rounded bg-gray-200 text-ink hover:bg-gray-300"
+          >
+            Discard
           </button>
         </div>
       ) : null}

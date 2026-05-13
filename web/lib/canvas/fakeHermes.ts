@@ -72,11 +72,45 @@ const stockSource = {
 
 type Draft = Omit<HermesAction, "id" | "state" | "proposed_at">;
 
-export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Draft | { error: string } {
+// Public marker proving the composer is running locally. The store asserts
+// fixture_only=true on every applied action, so this constant must be true
+// for the lab to function.
+export const HERMES_LAB_FIXTURE_ONLY = true as const;
+
+// Build-time invariant: refuses to compile if anyone wires the fakeHermes
+// composer to a real provider. Production should NOT import buildProposal.
+export interface ProvenanceMark {
+  readonly fixture_only: true;
+  readonly composer: "hermes-lab/fake-hermes";
+}
+
+const PROVENANCE: ProvenanceMark = { fixture_only: true, composer: "hermes-lab/fake-hermes" };
+
+function withProvenance(d: Omit<Draft, "fixture_only">): Draft {
+  // Defense in depth: every fakeHermes draft is stamped fixture_only. The store
+  // refuses to apply actions without this marker, so accidentally piping real
+  // model output through this path would fail loudly at apply time.
+  return { ...d, fixture_only: PROVENANCE.fixture_only };
+}
+
+// Stable widget id helper. fakeHermes uses (promptId, canvas.version) so that
+// the same prompt against the same canvas version always produces the same id —
+// makes deterministic tests and idem_key dedupe work without real time.
+function stableId(prefix: string, promptId: string, canvas: Canvas) {
+  return `${prefix}_${promptId}_v${canvas.version}`;
+}
+
+export type BuildProposalError = { __error: string };
+export function isBuildProposalError(d: Draft | BuildProposalError): d is BuildProposalError {
+  return (d as BuildProposalError).__error !== undefined;
+}
+
+export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Draft | BuildProposalError {
   switch (promptId) {
     case "scan_for_metric": {
       const widget: CanvasWidget = {
-        id: `w_metric_hc_${canvas.version}`,
+        id: stableId("w_metric_hc", promptId, canvas),
+        idem_key: `fakeHermes:${promptId}:headcount`,
         kind: "metric",
         title: "Headcount",
         description: "Reported on the Q1 earnings call.",
@@ -94,18 +128,19 @@ export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Dra
         ],
         data: { label: "Headcount", value: "4,300", as_of: "2026-03-31", delta: "+12% YoY" },
       };
-      return {
+      return withProvenance({
         kind: "append_widget",
         payload: { widget },
         rationale: "Q1 earnings call reported headcount; useful sizing metric.",
         evidence: [stockSource],
         proposed_by: "hermes",
         confidence: "High",
-      };
+      });
     }
     case "add_open_question": {
       const widget: CanvasWidget = {
-        id: `w_oq_followup_${canvas.version}`,
+        id: stableId("w_oq_followup", promptId, canvas),
+        idem_key: `fakeHermes:${promptId}:followup`,
         kind: "open_questions",
         title: "Follow-up questions",
         description: "Hermes flagged these from the Q1 transcript.",
@@ -126,19 +161,19 @@ export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Dra
           ],
         },
       };
-      return {
+      return withProvenance({
         kind: "append_widget",
         payload: { widget },
         rationale: "Open questions surfaced from Q1 transcript.",
         evidence: [stockSource],
         proposed_by: "hermes",
         confidence: "Medium",
-      };
+      });
     }
     case "add_evidence_to_first": {
       const first = canvas.widgets[0];
-      if (!first) return { error: "no widgets to attach evidence to" };
-      return {
+      if (!first) return { __error: "no widgets to attach evidence to" };
+      return withProvenance({
         kind: "add_evidence",
         payload: {
           widget_id: first.id,
@@ -150,11 +185,12 @@ export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Dra
         evidence: [stockSource],
         proposed_by: "hermes",
         confidence: "High",
-      };
+      });
     }
     case "propose_action_panel": {
       const widget: CanvasWidget = {
-        id: `w_actions_proposed_${canvas.version}`,
+        id: stableId("w_actions_proposed", promptId, canvas),
+        idem_key: `fakeHermes:${promptId}:post-earnings`,
         kind: "action_panel",
         title: "Proposed motion: post-earnings outreach",
         description: "Hermes-drafted action plan.",
@@ -175,38 +211,38 @@ export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Dra
           ],
         },
       };
-      return {
+      return withProvenance({
         kind: "append_widget",
         payload: { widget },
         rationale: "Action panels influence sales motion — propose, don't apply.",
         evidence: [stockSource],
         proposed_by: "hermes",
         confidence: "Medium",
-      };
+      });
     }
     case "propose_remove_section_ref": {
       const target = canvas.widgets.find((w) => w.kind === "section_ref");
-      if (!target) return { error: "no section_ref widget to remove" };
-      return {
+      if (!target) return { __error: "no section_ref widget to remove" };
+      return withProvenance({
         kind: "remove_widget",
         payload: { widget_id: target.id },
         rationale: "Legacy section reference is duplicated by newer widgets.",
         evidence: [stockSource],
         proposed_by: "hermes",
         confidence: "Medium",
-      };
+      });
     }
     case "propose_refresh_evidence_board": {
       const target = canvas.widgets.find((w) => w.kind === "evidence_board");
-      if (!target) return { error: "no evidence_board to refresh" };
-      return {
+      if (!target) return { __error: "no evidence_board to refresh" };
+      return withProvenance({
         kind: "propose_refresh",
         payload: { widget_id: target.id, scope: "widget", reason: "Last refresh 30+ days ago." },
         rationale: "Evidence board likely stale; refresh hits external sources.",
         evidence: [],
         proposed_by: "hermes",
         confidence: "Medium",
-      };
+      });
     }
   }
 }

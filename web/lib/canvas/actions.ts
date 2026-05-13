@@ -47,11 +47,17 @@ export const HermesAction = z.object({
   evidence: z.array(Source).default([]),
   proposed_at: z.string(),
   proposed_by: z.enum(["hermes", "user", "system"]),
-  state: z.enum(["proposed", "auto_applied", "applied", "rejected", "expired", "undone"]),
+  state: z.enum(["proposed", "applying", "auto_applied", "applied", "failed", "rejected", "expired", "undone"]),
   confidence: Confidence,
   decided_at: z.string().optional(),
   decided_by: z.string().optional(),
   reject_reason: z.string().optional(),
+  error: z.string().optional(),
+  retry_of: z.string().optional(),
+  // Marker proving the action originated from the lab fixture composer rather
+  // than a real Hermes call. Required on every action emitted in the lab; the
+  // store refuses to apply actions missing this marker (defense in depth).
+  fixture_only: z.boolean().default(true),
 });
 export type HermesAction = z.infer<typeof HermesAction>;
 

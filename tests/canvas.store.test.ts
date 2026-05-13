@@ -22,6 +22,7 @@ function draft(over: Partial<Omit<HermesAction, "id" | "state" | "proposed_at">>
     evidence: [stockSource],
     proposed_by: "hermes" as const,
     confidence: "High" as const,
+    fixture_only: true,
     ...over,
   };
 }

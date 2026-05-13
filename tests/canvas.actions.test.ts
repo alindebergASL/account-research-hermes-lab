@@ -21,6 +21,7 @@ function makeAction(partial: Partial<HermesAction>): HermesAction {
     proposed_by: "hermes",
     state: "proposed",
     confidence: "High",
+    fixture_only: true,
     ...partial,
   };
 }
