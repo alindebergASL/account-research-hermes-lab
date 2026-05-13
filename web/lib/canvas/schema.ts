@@ -19,7 +19,7 @@ export const WidgetKind = z.enum([
 ]);
 export type WidgetKind = z.infer<typeof WidgetKind>;
 
-export const WidgetSource = z.enum(["model", "chat", "user", "system", "refresh", "hermes"]);
+export const WidgetSource = z.enum(["model", "research", "chat", "user", "system", "refresh", "hermes"]);
 export type WidgetSource = z.infer<typeof WidgetSource>;
 
 export const WidgetStatus = z.enum(["fresh", "stale", "watching", "archived"]);

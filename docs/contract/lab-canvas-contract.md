@@ -108,7 +108,7 @@ may differ.)
 | Confidence enum values | `High` / `Medium` / `Low` / `Not found` | Must match exactly. If production uses lower-case, normalize at the bridge. |
 | Source URL | Required string | Production extension `Source` is identical. |
 | `Evidence.added_at` | Required ISO string | Production may not have an analogue; consider making lab's `Evidence.added_at` optional before promotion. |
-| Extension source enum | Lab: `model | chat | user | system | refresh | hermes` | Production `BriefExtension.source` (post PR #10): `model | chat | research`. **Lab `WidgetSource` should be a strict superset** so production can map directly. (Already true.) |
+| Extension source enum | Lab: `model | research | chat | user | system | refresh | hermes` | Production `BriefExtension.source` (post PR #10): `model | chat | research`. Lab `WidgetSource` is a strict superset so production can map directly. |
 | Read path | `loadState()` from localStorage | Production reads from DB column on the brief. The lab loadState should not be reused. |
 | Write path | `propose/approve/reject/retry/undo` | Production has no write path yet. Do not introduce one without Track 1's safety rails. |
 

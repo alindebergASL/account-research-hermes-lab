@@ -11,6 +11,7 @@ import {
   PersistedState,
 } from "../web/lib/canvas/store";
 import type { HermesAction } from "../web/lib/canvas/actions";
+import { WidgetSource } from "../web/lib/canvas/contract";
 
 const stockSource = {
   title: "Test source",
@@ -34,6 +35,13 @@ function safeAppendDraft(over: Partial<Omit<HermesAction, "id" | "state" | "prop
     ...over,
   };
 }
+
+test("contract WidgetSource is a strict superset of production extension sources", () => {
+  assert.equal(WidgetSource.parse("model"), "model");
+  assert.equal(WidgetSource.parse("research"), "research");
+  assert.equal(WidgetSource.parse("chat"), "chat");
+  assert.equal(WidgetSource.parse("hermes"), "hermes");
+});
 
 test("idem_key dedupes a duplicate append_widget", () => {
   const canvas = demoCanvas();

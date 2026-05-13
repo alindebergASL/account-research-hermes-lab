@@ -25,21 +25,13 @@ test("every prompt produces a draft (or a typed error) for the demo canvas", () 
   }
 });
 
-test("fakeHermes is deterministic per (promptId, canvas.version) modulo timestamps", () => {
+test("fakeHermes is deterministic per (promptId, canvas.version)", () => {
   const canvas = demoCanvas();
-  function strip(d: unknown): unknown {
-    return JSON.parse(
-      JSON.stringify(d, (k, v) => {
-        if (k === "created_at" || k === "updated_at" || k === "added_at") return "<ts>";
-        return v;
-      }),
-    );
-  }
   for (const p of FAKE_HERMES_PROMPTS) {
     const a = buildProposal(p.id, canvas);
     const b = buildProposal(p.id, canvas);
     if (isBuildProposalError(a) || isBuildProposalError(b)) continue;
-    assert.deepEqual(strip(a), strip(b), `prompt ${p.id} not deterministic`);
+    assert.deepEqual(a, b, `prompt ${p.id} not deterministic`);
   }
 });
 

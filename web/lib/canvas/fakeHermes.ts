@@ -69,6 +69,7 @@ const stockSource = {
   url: "https://example.com/acme/q1-2026",
   accessed: "2026-05-09",
 };
+const FIXTURE_TIMESTAMP = "2026-05-09T00:00:00.000Z";
 
 type Draft = Omit<HermesAction, "id" | "state" | "proposed_at">;
 
@@ -115,8 +116,8 @@ export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Dra
         title: "Headcount",
         description: "Reported on the Q1 earnings call.",
         source: "hermes",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        created_at: FIXTURE_TIMESTAMP,
+        updated_at: FIXTURE_TIMESTAMP,
         confidence: "High",
         why_included: "Sizing signal; growing 12% YoY.",
         sources: [stockSource],
@@ -124,7 +125,7 @@ export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Dra
         controls: { can_refresh: true, can_remove: true, can_edit: true, can_export: false },
         status: "fresh",
         evidence: [
-          { text: "Headcount reported as 4,300 in Q1 2026 call.", source: stockSource, added_at: new Date().toISOString(), confidence: "High" },
+          { text: "Headcount reported as 4,300 in Q1 2026 call.", source: stockSource, added_at: FIXTURE_TIMESTAMP, confidence: "High" },
         ],
         data: { label: "Headcount", value: "4,300", as_of: "2026-03-31", delta: "+12% YoY" },
       };
@@ -145,8 +146,8 @@ export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Dra
         title: "Follow-up questions",
         description: "Hermes flagged these from the Q1 transcript.",
         source: "hermes",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        created_at: FIXTURE_TIMESTAMP,
+        updated_at: FIXTURE_TIMESTAMP,
         confidence: "Medium",
         why_included: "Gaps Hermes noticed after parsing the call transcript.",
         sources: [stockSource],
@@ -195,8 +196,8 @@ export function buildProposal(promptId: FakeHermesPromptId, canvas: Canvas): Dra
         title: "Proposed motion: post-earnings outreach",
         description: "Hermes-drafted action plan.",
         source: "hermes",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        created_at: FIXTURE_TIMESTAMP,
+        updated_at: FIXTURE_TIMESTAMP,
         confidence: "Medium",
         why_included: "Translates earnings signals into immediate plays.",
         sources: [stockSource],
