@@ -8,7 +8,7 @@ A working prototype of a Canvas-native view that the existing Brief view structu
 
 Live route in the lab: `/lab/canvas/priority-map`.
 
-Demo account: `Acme Regional Health` (regional healthcare system, mid-program AI review). The fixture is hand-tuned so the derivation produces a useful spread across the matrix — but the derivation itself is generic and works against any Brief that conforms to the current production schema.
+Demo account: `Acme Regional Health` (regional healthcare system, mid-program AI review). The page renders this single hand-tuned fixture with a "Show derived JSON" toggle for product review — there is **no** account picker in the prototype. Adding one would be a small follow-up; the derivation function works against any Brief that conforms to the production schema.
 
 ## Why this is Canvas-native
 
@@ -150,21 +150,31 @@ These would be improvements but should not block a production port:
 
 ## Port-back plan
 
-**PR-A (lab→prod, mechanical):**
-- Copy `web/lib/canvas/priorityMap/{schema,derive}.ts` into the production repo verbatim.
+**Important — do not copy the lab schema verbatim.** The lab module redeclares a local `Confidence` Zod enum (`web/lib/canvas/priorityMap/schema.ts`) so the prototype is sandbox-isolated and has no dependency on production's Brief schema. **In production, the priority-map schema must reuse / import production's existing `Confidence` definition** rather than redeclaring it. The local redeclaration is for lab isolation only and is not part of the recommended production shape.
+
+Likewise, the **`/lab` entry added to `web/middleware.ts` `PUBLIC_PATHS` is lab-only** and must not be ported. Production's Canvas continues to be gated by the existing server/admin Canvas gate:
+
+- `CANVAS_PREVIEW_ENABLED=1` (server env, default off)
+- admin role required
+- not exposed to the public-share route
+
+**PR-A (lab→prod):**
+- Port the **shapes** of `web/lib/canvas/priorityMap/schema.ts` into production, but rewrite the import line to use production's existing `Confidence` enum from `web/lib/schema.ts`. Drop the local `Confidence` redeclaration — it is sandbox-isolation scaffolding only. All other types (`PriorityMap`, `PriorityMapInitiative`, `PriorityMapNode`, `RelationshipEdge`, `RelationshipKind`) port unchanged.
+- Port `web/lib/canvas/priorityMap/derive.ts` as a pure function. No edits needed beyond the `Confidence` import path.
 - Add `priority_map` to production's `WidgetKind` enum and to its registry.
-- Add a deterministic test mirroring `tests/priorityMap.derive.test.ts` against a representative production fixture.
+- Mirror `tests/priorityMap.derive.test.ts` against a representative production-shape fixture.
 - No DB migration. No API route. No model calls. Pure derivation at bridge time.
+- **Do NOT** port `web/middleware.ts` changes. **Do NOT** port `web/lib/canvas/priorityMap/fixtures.ts` (lab-only demo data). **Do NOT** port `web/app/lab/canvas/priority-map/page.tsx` (lab demo route).
 
 **PR-B (visual):**
-- Copy `web/components/canvas/PriorityMap.tsx` minus the lab demo route.
-- Mount it in production's Canvas behind the same `NEXT_PUBLIC_ENABLE_CANVAS_BRIDGE` flag.
-- Visual QA against three representative briefs (one high-data, one medium, one sparse) before lighting the flag on.
+- Port `web/components/canvas/PriorityMap.tsx` (the visual component itself). Drop any lab-specific imports.
+- Mount it in production's Canvas under the **existing** server-side Canvas gate — `CANVAS_PREVIEW_ENABLED=1` + admin role — not under any new flag and explicitly not exposed via the public share route. If production has additional preview flags, follow whatever is already in place; do not introduce a new client-visible flag for this.
+- Visual QA against three representative briefs (one high-data, one medium, one sparse) before flipping the env var on.
 
 **PR-C (refresh wiring):**
-- Re-run `derivePriorityMap(brief)` on brief refresh / revert / version select, same way other derived widgets refresh today.
+- Re-run `derivePriorityMap(brief)` on brief refresh / revert / version select, the same way other derived widgets refresh today.
 
-No DB migration is required for any step. The `PriorityMap` is computed on read and stored only in the canvas JSON column the production bridge already uses; if production prefers to skip serialization entirely, it can also compute the map on every render — the function is microsecond-fast and pure.
+No DB migration is required for any step. The `PriorityMap` is computed on read; if production prefers to skip serialization entirely, it can also compute the map on every render — the function is microsecond-fast and pure.
 
 ## Verification
 
