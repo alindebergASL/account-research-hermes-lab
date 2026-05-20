@@ -132,16 +132,59 @@ GET /api/briefs/[id]/hermes-events  ← PR32 route, untouched
 GET /api/briefs/[id]/hermes-events/stream  ← PR32 route, untouched
 ```
 
-### 2.3 Wire shapes (existing, reused)
+### 2.3 Wire shapes — required PR32 extension (corrected per Hermes review)
 
-The gateway operates on **the response shapes PR32 already defined** in `web/lib/hermes/types.ts`. This plan does not invent new wire types:
+PR32 today defines:
 
-- `HermesChatResponse` — tool calls (existing brief-patch tool today; potentially a canvas-op tool tomorrow).
-- `HermesCanvasSynthesisResponse` — typed canvas operations.
+```ts
+// web/lib/hermes/types.ts (production main, verified)
+export type HermesCanvasSynthesisResponse = {
+  canvas: Canvas;
+  extensions?: BriefExtension[];
+  events?: HermesRuntimeEventInput[];
+};
 
-If those shapes do not yet carry the canvas-op data we need, the implementing engineer extends them inside the existing module — they are still PR32's wire types, not ours.
+export type HermesChatResponse = {
+  reply: string;
+  patches_applied: BriefPatch[];
+  patch_errors: string[];
+  brief?: Brief;
+  canvas?: Canvas;
+  events?: HermesRuntimeEventInput[];
+};
+```
 
-For internal use (gateway → store), the gateway projects the response into the existing lab `HermesAction` shape (`web/lib/canvas/actions.ts` on `hermes-lab/dynamic-canvas`) so the existing reducer and lifecycle FSM can be reused. **No new `RuntimeRequest`/`RuntimeResponse` types** — that was the old plan's mistake.
+Neither response carries typed canvas operations. The gateway therefore cannot project today's PR32 responses into `HermesAction[]` without a wire change.
+
+**Decision:** extend both PR32 response shapes with an **optional** `canvas_actions?: HermesAction[]` field. **Do not** create a parallel `RuntimeRequest` / `RuntimeResponse` shape.
+
+```ts
+// web/lib/hermes/types.ts (proposed extension, additive)
+export type HermesCanvasSynthesisResponse = {
+  canvas: Canvas;                         // legacy / full-state synthesis path
+  canvas_actions?: HermesAction[];        // NEW — typed operations, preferred when present
+  extensions?: BriefExtension[];
+  events?: HermesRuntimeEventInput[];
+};
+
+export type HermesChatResponse = {
+  reply: string;
+  patches_applied: BriefPatch[];
+  patch_errors: string[];
+  brief?: Brief;
+  canvas?: Canvas;                        // legacy / full-state synthesis path
+  canvas_actions?: HermesAction[];        // NEW — typed operations, preferred when present
+  events?: HermesRuntimeEventInput[];
+};
+```
+
+Behavioral rules for the gateway:
+
+- If `canvas_actions` is present and non-empty → run each through the proposal lifecycle (§2.6). This is the path this plan is designed for.
+- If `canvas_actions` is absent or empty but `canvas` (full state) is present → preserve PR32's existing legacy/full-state behavior: `saveCanvasState()` server-side with `source: "hermes"`, no proposal rows, no lifecycle. This keeps PR32 dormant deployments byte-identical.
+- The two paths are mutually exclusive per response; if both are present the gateway treats `canvas_actions` as authoritative and logs a `hermes_job_events` row (`event_type: "canvas_proposal.rejected"`, `payload: { error_code: "ambiguous_response_both_canvas_and_actions" }`) but still uses `canvas_actions`.
+
+**`HermesAction` is the existing lab schema** at `web/lib/canvas/actions.ts` on `hermes-lab/dynamic-canvas`. Promoting it from lab into production via `lib/canvas/contract.ts` (see the promotion contract doc) is a prerequisite of this milestone.
 
 ### 2.4 Canvas operation schema (reused)
 
@@ -166,9 +209,9 @@ Implemented as a single table in the gateway, not scattered. Disallowed combos �
 HermesCanvasSynthesisResponse arrives
   ├── HERMES_RUNTIME_ENABLED != 1?         → 404 / dormant (route should not exist)
   ├── envelope schema invalid?              → reject; one hermes_job_event row
-                                              (event_type="canvas_proposal.rejected",
-                                               metadata={ error_code: "schema_invalid",
-                                                          request_id?, source });
+                                              (kind="canvas_proposal.rejected",
+                                               payload={ error_code: "schema_invalid",
+                                                         request_id?, source });
                                               NO canvas_action_proposals row
   ├── HERMES_RUNTIME_FAKE expected, marker missing?
                                             → reject; same pattern, code=fake_marker_missing
@@ -202,17 +245,17 @@ HermesCanvasSynthesisResponse arrives
 Resolves the contradiction the reviewer flagged in the prior plan:
 
 **Malformed envelope (`schema_invalid`):**
-- Gateway returns HTTP 400 to the caller (sidecar adapter / chat adapter).
+- Gateway returns an error to the caller (a thrown `GatewayError` for in-process adapter calls; if the gateway is ever surfaced as an HTTP route, this maps to HTTP 400 — but per §4.1 it is not an HTTP route in this milestone).
 - **No** `canvas_action_proposals` row written.
-- **One** `hermes_job_events` row written with:
-  - `event_type = "canvas_proposal.rejected"`
-  - `metadata = { error_code: "schema_invalid", request_id?: string, source: "chatAdapter"|"canvasSynthesis"|"manual", validation_path: string }`
-  - Raw payload **never** stored. We persist only the Zod error path (e.g. `"action.payload.widget.title"`), not the offending value.
-- UI: the malformed request appears in the existing `/hermes-events/stream` SSE feed (it's a real `hermes_job_events` row); it does **not** appear in the proposal queue UI (no proposals row).
+- **One** `hermes_job_events` row appended via the existing PR32 helper:
+  - `kind = "canvas_proposal.rejected"` (must be added to the `HermesEventKind` union — see §2.8.1)
+  - `payload = { error_code: "schema_invalid", request_id?: string, source: "chatAdapter"|"canvasSynthesis", validation_path: string }`
+  - Persisted in column `payload_json`. Raw envelope body **never** stored. We persist only the Zod error path (e.g. `"canvas_actions.0.payload.widget.title"`), not the offending value.
+- UI: the rejected request appears in the existing `/hermes-events/stream` SSE feed (it's a real `hermes_job_events` row); it does **not** appear in the proposal queue UI (no proposals row).
 - Rationale: the lab operator can see the request happened, classify it, and triage; the proposal queue stays clean of garbage.
 
 Other error codes (`version_stale`, `policy_denied`, `rate_limited`, `fake_marker_missing`, `timeout`):
-- Same pattern: HTTP error to caller, **one** `hermes_job_events` row written, **no** `canvas_action_proposals` row, raw payload not persisted (only field paths / counts).
+- Same pattern: error thrown to caller, **one** `hermes_job_events` row appended (with the corresponding `kind`), **no** `canvas_action_proposals` row, raw envelope not persisted (only field paths / error codes / counts in `payload`).
 - These never appear in the proposal queue UI; they show only in the event stream.
 
 Apply-time failure (`reducer_rejected`, e.g. `idem_key` collision, target widget missing):
@@ -242,25 +285,66 @@ Reviewer's prompt said "A new `canvas_action_proposals` table is probably accept
 
 `brief_events` is the human-readable timeline for the brief. We append a `brief_events` row **only when canvas state actually changes** (auto-apply or post-approve apply). That keeps `brief_events` from being polluted with proposal noise.
 
+### 2.8.1 `HermesEventKind` extension (required)
+
+Per Hermes review: although the SQLite column `event_type` is free TEXT, the TypeScript helper that appends events takes `kind: HermesEventKind`. Today `HermesEventKind` does **not** include any `canvas_proposal.*` variants. The plan therefore requires extending `HermesEventKind` in `web/lib/hermes/types.ts` (or wherever PR32 defines it) with the following exact literals:
+
+```ts
+// proposed addition to HermesEventKind
+| "canvas_proposal.queued"
+| "canvas_proposal.auto_applied"
+| "canvas_proposal.applied"
+| "canvas_proposal.failed"
+| "canvas_proposal.rejected"           // pre-proposal rejection (schema/policy/version/rate/timeout)
+| "canvas_proposal.rejected_by_user"
+| "canvas_proposal.undone"
+| "canvas_proposal.retried"
+| "canvas_proposal.timeout"
+```
+
+The DB column is unchanged (`event_type TEXT`); only the type union and any local exhaustiveness switches need updating. This is a typing-only extension and ships in the same PR as the gateway. No migration is required to add these kinds because the column accepts arbitrary strings.
+
+### 2.8.2 Event row shape (PR32-correct naming)
+
+Per Hermes review: the existing PR32 helper writes to **`payload_json`** (column) via a typed `payload` parameter — not `metadata`. All references in this plan use `payload`. A `canvas_proposal.queued` row, for example, looks like:
+
+```ts
+appendHermesJobEvent({
+  job_id,
+  brief_id,
+  kind: "canvas_proposal.queued",
+  payload: {
+    proposal_id: "ulid...",
+    action_kind: "append_widget",
+    proposed_by: "hermes",
+    confidence: "Medium",
+    request_id: "ulid...",
+  },
+});
+```
+
+The gateway never puts the raw `canvas_actions[i].payload` into `payload`; it only puts identifiers, action kinds, counts, and error codes — enough to audit, never enough to leak the offending value.
+
 ### 2.9 Authorization model (real, brief-scoped)
 
-Replacing all `account_id` language from the prior plan.
+Replacing all `account_id` language from the prior plan. Per Hermes review, the production app has **two distinct role enums** and they must not be conflated:
+
+- **User roles** (global, on the user record): `admin` / `member` / `viewer`.
+- **Share roles** (per-brief, on `brief_shares.role`): `reader` / `editor`.
+
+The gateway never inspects either enum directly. All authorization goes through the existing `requireUser`, `canReadBrief(briefId)`, and `canWriteBrief(briefId)` helpers (`web/lib/auth.ts`) — the same helpers PR32's `/canvas-state` route already uses. Those helpers internally encapsulate the user-role × share-role logic; the gateway code stays unaware of role-string literals.
 
 | Operation | Required |
 |---|---|
-| `POST /api/briefs/[id]/canvas-proposals` (internal route, lab-only, called by adapters; not a public API) | adapter has `HERMES_SERVICE_TOKEN`; brief must exist; `HERMES_RUNTIME_ENABLED=1` |
-| `GET /api/briefs/[id]/canvas-proposals` | `requireUser` + `canReadBrief(briefId)` (reader+) |
-| `POST /api/briefs/[id]/canvas-proposals/[pid]/approve` | `requireUser` + `canWriteBrief(briefId)` (editor or admin) |
+| `GET /api/briefs/[id]/canvas-proposals` | `requireUser` + `canReadBrief(briefId)` |
+| `POST /api/briefs/[id]/canvas-proposals/[pid]/approve` | `requireUser` + `canWriteBrief(briefId)` |
 | `POST /api/briefs/[id]/canvas-proposals/[pid]/reject` | `requireUser` + `canWriteBrief(briefId)` |
 | `POST /api/briefs/[id]/canvas-proposals/[pid]/retry` | `requireUser` + `canWriteBrief(briefId)` |
 | `POST /api/briefs/[id]/canvas-proposals/[pid]/undo` | `requireUser` + `canWriteBrief(briefId)` |
 
-Uses existing `requireUser`, `canReadBrief`, `canWriteBrief` helpers (`web/lib/auth.ts`) — same helpers the production chat route uses. **Public share routes (`/s/[token]/...`) are not touched**; the proposal queue is never exposed to share viewers.
+(There is **no** internal HTTP POST for proposal ingestion — see §4.1 for the corrected design.)
 
-Role mapping per existing `brief_shares.role`:
-- `viewer`/`reader` → read proposals + audit, cannot approve/reject.
-- `editor` → all of viewer + approve/reject/retry/undo on this brief.
-- `admin` (global) → same as editor on any brief.
+Public share routes (`/s/[token]/...`) are not touched; the proposal queue is never exposed to share viewers. Share-grant `reader` does not get approve/reject (only `canWriteBrief` does, which is share-grant `editor` or user-role `admin`/`member`-on-own-brief, depending on what the existing helpers compute).
 
 ---
 
@@ -304,24 +388,28 @@ CREATE INDEX idx_canvas_proposals_job ON canvas_action_proposals(job_id);
 - **No `canvas_audit_events`** — superseded by reusing `hermes_job_events` (§2.8).
 - **No new `canvas_states`** — table already exists from migration `013` and we use its `brief_id`, `version`, `updated_by_job_id` exactly as PR32 defines them.
 
-### 3.3 `canvas_states` interaction
-- Reads: gateway reads `(version, canvas_json)` to enforce optimistic concurrency.
-- Writes: gateway updates `canvas_json`, increments `version`, sets `updated_at = now()`, sets `updated_by_job_id` to the originating job id when present. `source` is set to a stable string like `"hermes_proposal_auto"` / `"hermes_proposal_applied"` to distinguish from PR32's existing sources.
+### 3.3 `canvas_states` interaction (corrected per Hermes review)
+- Reads: gateway reads `(version, canvas_json)` from the existing `canvas_states` row by `brief_id` to enforce optimistic concurrency.
+- Writes: gateway calls the existing `saveCanvasState()` helper (do **not** add a new PUT route — see §4.1). The helper accepts `jobId?: string | null`, so `updated_by_job_id` is set when the proposal came from a Hermes job and left NULL otherwise.
+- **`source` stays inside PR32's existing constrained set** (`"deterministic" | "hermes" | "fake"` per Hermes review). The gateway always writes `source: "hermes"` for proposal-driven applies. **Do not** invent `"hermes_proposal_auto"` / `"hermes_proposal_applied"` strings.
+- Provenance discrimination (auto vs. human-approved, proposal id, request id) lives in the matching `hermes_job_events.payload`, not in `canvas_states.source`.
 - The gateway **never** writes `canvas_states` for non-applied proposals.
 
-### 3.4 `hermes_job_events` interaction
-Add three new `event_type` values used by the gateway (no schema change needed if `event_type` is a free string column):
-- `canvas_proposal.rejected` — pre-proposal rejections (schema_invalid, version_stale, policy_denied, rate_limited, fake_marker_missing). Metadata describes the reason; no payload stored.
+### 3.4 `hermes_job_events` interaction (corrected per Hermes review)
+
+The SQLite column `event_type` is **free TEXT** (no CHECK / no migration needed). The constraint lives in TypeScript: the helper takes `kind: HermesEventKind`. Per §2.8.1, we extend the `HermesEventKind` union with these literals:
+
 - `canvas_proposal.queued` — proposal accepted, awaiting approval.
 - `canvas_proposal.auto_applied` — proposal applied without human approval.
 - `canvas_proposal.applied` — proposal applied after human approval.
-- `canvas_proposal.failed` — proposal valid but reducer rejected it.
+- `canvas_proposal.failed` — proposal valid but reducer rejected it (post-validation apply failure).
+- `canvas_proposal.rejected` — pre-proposal rejection (schema_invalid, version_stale, policy_denied, rate_limited, fake_marker_missing, ambiguous_response_both_canvas_and_actions). `payload.error_code` discriminates.
 - `canvas_proposal.rejected_by_user` — human reject.
 - `canvas_proposal.undone` — human undo.
 - `canvas_proposal.retried` — human retry created a new proposal.
 - `canvas_proposal.timeout` — sidecar/apply timeout.
 
-If `hermes_job_events.event_type` is a CHECK constraint or enum (likely [per brief check needed]), this list must be added to that constraint in migration `014` as a single ALTER. Document at implementation time.
+Each row is appended through PR32's existing event helper. The helper's `payload` argument is serialized to the `payload_json` column. The gateway only puts identifiers, action kinds, counts, and error codes into `payload` — never raw envelope content.
 
 ### 3.5 `brief_events` interaction
 One row appended per **applied** canvas change (auto-applied or post-approve applied). Not per proposal. Keeps the human-readable brief timeline clean.
@@ -336,40 +424,59 @@ Per-proposal snapshot (`canvas_before_json` + `canvas_after_json`) for undo. Sim
 
 ## 4. API / server plan
 
-### 4.1 Routes to add (lab-only, all under existing brief auth)
+### 4.1 Routes to add (lab-only, all under existing brief auth) (corrected per Hermes review)
+
+**There is no internal POST route for proposal ingestion.** Per Hermes review the previous design (POST `/api/briefs/[id]/canvas-proposals` authenticated by `HERMES_SERVICE_TOKEN`) is the app calling itself over HTTP for no reason. Adapters live in the same Next.js process and call the gateway module directly.
+
+Gateway module to add:
+
+```
+web/lib/hermes/canvasProposalGateway.ts
+```
+
+Exported entry points (in-process function calls, not HTTP):
+
+- `ingestCanvasActions(ctx, response)` — called by `chatAdapter.ts` and `researchAdapter.ts` after a Hermes runtime response is received. Reads `response.canvas_actions ?? []`, runs the decision tree from §2.6, persists proposals/audit, and (for auto-apply) calls `saveCanvasState()`.
+- `approveProposal(ctx, proposalId)` — invoked by the approve route handler.
+- `rejectProposal(ctx, proposalId, reason)` — invoked by the reject route handler.
+- `retryProposal(ctx, proposalId)` — invoked by the retry route handler.
+- `undoProposal(ctx, proposalId)` — invoked by the undo route handler.
+- `listProposals(ctx, briefId, filter)` — invoked by the GET route handler.
+
+The browser-facing routes are the only HTTP surface this milestone adds:
 
 | Path | Verb | Purpose |
 |---|---|---|
-| `POST /api/briefs/[id]/canvas-proposals` | POST | Internal callable. Adapter posts a typed proposal envelope here. Authenticated by `HERMES_SERVICE_TOKEN` header; never exposed to browsers. |
-| `GET /api/briefs/[id]/canvas-proposals` | GET | List proposals for a brief, filterable by status. Browser/UI. |
+| `GET /api/briefs/[id]/canvas-proposals` | GET | List proposals for a brief, filterable by status. |
 | `POST /api/briefs/[id]/canvas-proposals/[pid]/approve` | POST | Approve a queued proposal. |
 | `POST /api/briefs/[id]/canvas-proposals/[pid]/reject` | POST | Body `{ reason }`. |
 | `POST /api/briefs/[id]/canvas-proposals/[pid]/retry` | POST | Re-emit a failed proposal as a new queued proposal. |
 | `POST /api/briefs/[id]/canvas-proposals/[pid]/undo` | POST | Undo an auto-applied or applied proposal. |
 
-All six routes:
-- Return 404 unless `HERMES_RUNTIME_ENABLED=1`.
+All five routes:
+- Return 404 unless `HERMES_RUNTIME_ENABLED=1` AND `HERMES_CANVAS_PROPOSALS_ENABLED=1`.
 - Use `requireUser` + `canReadBrief` / `canWriteBrief` from `web/lib/auth.ts`.
 - Never accept share-token auth. Never available on `/s/[token]/...`.
 - Reject cross-brief writes by route shape.
+- Are thin wrappers — each handler validates auth, parses params, calls the matching `canvasProposalGateway` function, returns the result. No business logic in the route file.
 
-The internal `POST .../canvas-proposals` route additionally:
-- Requires `HERMES_SERVICE_TOKEN` header equal to `process.env.HERMES_SERVICE_TOKEN` (PR32's existing secret).
-- Refuses any envelope missing `lab_only: true` (or whatever PR32's existing fake marker is) when `HERMES_RUNTIME_FAKE=1`.
+`HERMES_SERVICE_TOKEN` continues to authenticate the **sidecar↔app** HTTP boundary that PR32 already owns. It is **not** used by the gateway because the gateway is in-process.
 
 ### 4.2 Routes NOT modified
-- `/api/briefs/[id]/canvas-state` (PR32) — unchanged. UI continues to read it.
-- `/api/briefs/[id]/hermes-events` (PR32) — unchanged. New event types flow through it automatically.
+- `/api/briefs/[id]/canvas-state` (PR32) — **stays GET-only**, unchanged. The gateway writes canvas state by calling the existing `saveCanvasState()` helper server-side. No new PUT/POST is added to this route. UI continues to read it.
+- `/api/briefs/[id]/hermes-events` (PR32) — unchanged. New `canvas_proposal.*` kinds flow through it automatically (free-TEXT column; typing extension is application-level).
 - `/api/briefs/[id]/hermes-events/stream` (PR32) — unchanged.
 - `/api/briefs/[id]/chat` (prod) — unchanged. The gateway only fires from inside `chatAdapter.ts` / `researchAdapter.ts`, which are already dormant behind `HERMES_RUNTIME_ENABLED`.
 - `/api/share/*`, `/s/[token]/*` — public share, untouched.
 - `/api/research`, `/api/research-jobs/*` — untouched.
 
 ### 4.3 Adapter changes (small, gated)
-- `web/lib/hermes/chatAdapter.ts` — when the chat tool-call output includes canvas operations, forward to the gateway instead of applying directly. Guarded by `HERMES_RUNTIME_ENABLED && HERMES_CANVAS_PROPOSALS_ENABLED`.
-- `web/lib/hermes/researchAdapter.ts` — same forwarding when the research path yields a canvas-synthesis response.
+- `web/lib/hermes/chatAdapter.ts` — when `response.canvas_actions?.length` is non-zero, call `ingestCanvasActions(ctx, response)` from the gateway module **directly**, in-process. When `canvas_actions` is empty/absent but `canvas` (full-state) is present, preserve PR32's existing behavior (legacy `saveCanvasState()` path with `source: "hermes"`). Guarded by `HERMES_RUNTIME_ENABLED && HERMES_CANVAS_PROPOSALS_ENABLED`.
+- `web/lib/hermes/researchAdapter.ts` — same forwarding rule for `HermesCanvasSynthesisResponse`.
 
-These are the **only** places the adapter behavior changes. If `HERMES_CANVAS_PROPOSALS_ENABLED=0`, the adapters behave exactly as PR32 shipped them.
+No HTTP call between the adapter and the gateway. No service token check on this path (PR32's `HERMES_SERVICE_TOKEN` only authenticates the sidecar↔app boundary).
+
+These are the **only** places adapter behavior changes. If `HERMES_CANVAS_PROPOSALS_ENABLED=0` (production default), the adapters behave exactly as PR32 shipped them and the `canvas_actions` field is treated as if absent.
 
 ### 4.4 Transport
 No new transport. The sidecar transport from PR32 (`HERMES_RUNTIME_URL`, `HERMES_SERVICE_TOKEN`, `HERMES_RUNTIME_BIND_HOST=127.0.0.1`) is the only transport. The previous plan's `CANVAS_RUNTIME_TRANSPORT` / `CANVAS_RUNTIME_PORT` / `CANVAS_RUNTIME_SHARED_SECRET` are **retracted** — they duplicated PR32's flags.
@@ -423,10 +530,11 @@ Theming, drag-reorder, keyboard shortcuts beyond what exists, animations, export
 ### 6.1 Unit tests
 | File (new) | Cases |
 |---|---|
-| `tests/canvas.gateway.contract.test.ts` | Projection `HermesCanvasSynthesisResponse → HermesAction[]`. Zod round-trip. Rejects unknown action kinds. |
+| `tests/canvas.gateway.contract.test.ts` | Extraction of `canvas_actions` from `HermesCanvasSynthesisResponse` and `HermesChatResponse`. Zod round-trip. Rejects unknown action kinds. Confirms legacy `canvas`-only responses do not trigger the proposal path. |
 | `tests/canvas.gateway.allowlist.test.ts` | Every `(proposed_by, action.kind)` pair table-driven. Asserts `policy_denied` for disallowed combos. |
 | `tests/canvas.gateway.policy.test.ts` | `propose_refresh` is never auto-apply. Confidence floor enforced. Evidence floor enforced. |
-| `tests/canvas.gateway.errors.test.ts` | **Each pre-proposal rejection writes exactly one `hermes_job_events` row and zero `canvas_action_proposals` rows.** Raw payload never appears in the metadata column. |
+| `tests/canvas.gateway.errors.test.ts` | **Each pre-proposal rejection writes exactly one `hermes_job_events` row (with the matching `kind` literal) and zero `canvas_action_proposals` rows.** `payload.error_code` is set. Raw envelope body never appears in `payload_json`. |
+| `tests/canvas.gateway.event_kinds.test.ts` | All `canvas_proposal.*` literals are members of `HermesEventKind`. Compile-time exhaustiveness check via a `switch` over each kind. |
 
 ### 6.2 Integration tests (lab sqlite)
 | File | Cases |
@@ -440,17 +548,18 @@ Theming, drag-reorder, keyboard shortcuts beyond what exists, animations, export
 All tests use temp DB files; never `web/data/briefs.sqlite`.
 
 ### 6.3 Browser QA checklist
-Run with `HERMES_RUNTIME_ENABLED=1 HERMES_RUNTIME_FAKE=1 HERMES_CANVAS_PROPOSALS_ENABLED=1 npm run dev`. Open `/lab/canvas/runtime?briefId=<id>`.
+Run with `HERMES_RUNTIME_ENABLED=1 HERMES_RUNTIME_FAKE=1 HERMES_CANVAS_PROPOSALS_ENABLED=1 npm run dev`. Open `/lab/canvas/runtime?briefId=<id>`. Since there is no internal POST route (§4.1), the "malformed envelope" cases are driven by fake-Hermes responses constructed in tests/dev fixtures, not by `curl`.
 
 - [ ] Page loads with the current `canvas_states` snapshot for the brief.
-- [ ] Triggering a fake Hermes job (existing PR32 affordance) produces a queued proposal that appears in the queue UI.
-- [ ] Triggering a fake Hermes job that meets auto-apply policy applies immediately; canvas updates after the SSE event.
+- [ ] Triggering a fake Hermes job that returns `canvas_actions` for non-auto-apply kinds produces a queued proposal that appears in the queue UI.
+- [ ] Triggering a fake Hermes job that returns `canvas_actions` meeting auto-apply policy applies immediately; canvas updates after the SSE event.
+- [ ] Triggering a fake Hermes job that returns **only** `canvas` (full-state, no `canvas_actions`) preserves PR32's legacy behavior: `canvas_states` updated with `source: "hermes"`, no proposal row, no `canvas_proposal.*` events.
 - [ ] Approving a queued proposal moves it to `applied`; canvas updates after SSE; `brief_events` shows the change.
 - [ ] Rejecting a queued proposal with a reason moves it to `rejected`; canvas unchanged; `brief_events` does **not** get a row.
 - [ ] Undo within 30s reverts; event strip shows `canvas_proposal.undone`.
-- [ ] Posting a malformed envelope to `/api/briefs/[id]/canvas-proposals` (with valid token) returns 400 + `error_code: "schema_invalid"`; the event strip shows a `canvas_proposal.rejected` event; the proposal queue is **unchanged**.
-- [ ] Posting a non-fake envelope while `HERMES_RUNTIME_FAKE=1` returns 400 + `fake_marker_missing`.
-- [ ] Posting twice with the same `request_id` is idempotent (returns the same proposal id).
+- [ ] A fake-Hermes response carrying a malformed `canvas_actions[i]` (e.g. missing required field) yields a thrown error to the adapter, no proposal row, and exactly one `canvas_proposal.rejected` event with `payload.error_code = "schema_invalid"` visible in the event strip.
+- [ ] A fake-Hermes response containing both `canvas` and `canvas_actions` records one `canvas_proposal.rejected` audit event with `payload.error_code = "ambiguous_response_both_canvas_and_actions"` and still proceeds using `canvas_actions`.
+- [ ] Posting twice through the adapter with the same `request_id` is idempotent (returns the same proposal id).
 - [ ] Rate limit triggers `rate_limited` on the configured threshold.
 - [ ] Reload the page; queue + canvas + event strip reload from the server.
 - [ ] Public share route (`/s/[token]/...`) is **unaffected**: open it as an unauthenticated viewer and confirm no proposals/events surface.
@@ -490,7 +599,11 @@ Done when all hold:
 | App-side gateway (B) vs. sidecar endpoint (A) | **B** | Keeps proposal lifecycle/auth/audit next to the brief model. Sidecar stays a model adapter. Reverting is cheap. |
 | Reuse `hermes_job_events` vs. new `canvas_audit_events` table | **Reuse** | PR32 already serializes the event stream. Single audit pipeline. We accept that `hermes_job_events.event_type` becomes the canonical canvas-proposal event vocab. |
 | Reuse `canvas_states` (PR32) | **Reuse** | Already exists with the right shape; matches PR32's source-of-truth choice. |
-| Reuse existing wire types vs. new RuntimeRequest/Response | **Reuse** | The prior plan invented `RuntimeRequest`/`RuntimeResponse` for no clear reason. Retracted. |
+| Reuse existing wire types vs. new RuntimeRequest/Response | **Reuse + additive extension** | PR32's existing `HermesCanvasSynthesisResponse` / `HermesChatResponse` are kept; we add an optional `canvas_actions?: HermesAction[]`. The prior `RuntimeRequest`/`RuntimeResponse` design is retracted. |
+| Internal HTTP `POST /canvas-proposals` vs. in-process gateway module | **In-process module** | App-calls-itself HTTP added latency, auth complexity, and a service-token check on a same-process call. Adapters now call `canvasProposalGateway.ts` directly. |
+| Write `canvas_states` via new PUT route vs. existing `saveCanvasState()` helper | **Helper** | `canvas-state` route stays GET-only per PR32. Gateway writes through the existing helper, keeping write authority in one place. |
+| New `canvas_states.source` values vs. reuse the existing enum | **Reuse `"hermes"`** | Provenance discrimination lives in `hermes_job_events.payload`, not in `source`. Avoids drifting PR32's three-value enum. |
+| Free-string `event_type` vs. typed `HermesEventKind` extension | **Typed extension** | SQLite accepts free strings but the helper requires a `HermesEventKind` value. Plan extends the union once; no migration needed. |
 | Reuse `HERMES_RUNTIME_*` flags | **Reuse** | Single source of truth for Hermes gating. No `CANVAS_RUNTIME_*` parallel namespace. |
 | Add only `HERMES_CANVAS_PROPOSALS_ENABLED` | **Yes** | Separates "proposal lifecycle on/off" from "Hermes on/off" — needed because the latter is a coarser gate. |
 | Reuse PR32 SSE vs. new polling | **SSE** | One source of truth for live updates. |
@@ -503,26 +616,34 @@ Done when all hold:
 
 ## 9. Open questions / blockers
 
-These need answers from someone with production-repo access before §3/§4 implementation begins. I cannot resolve them from this session.
+Resolved by Hermes review (now part of the plan above):
 
-1. **`HermesCanvasSynthesisResponse` shape.** Does PR32 already define a typed list of canvas operations on this response? If yes, what kinds (do they cover all six existing `HermesActionKind`s, or a subset)? If no, the gateway needs a projection from a less-typed shape — that's a real design change in `web/lib/hermes/types.ts`, not just glue.
-2. **`hermes_job_events.event_type`.** Is it a free TEXT column or constrained (CHECK / enum / app-side allowlist)? If constrained, migration `014` must extend it.
-3. **`canvas_states.source` allowed values.** PR32 defined this column; what string values is it expected to take? The plan assumes free-form strings (`"hermes_proposal_auto"`, `"hermes_proposal_applied"`). If it's an enum, the migration adds entries.
-4. **`canvas_states.updated_by_job_id` FK.** Does this reference `hermes_jobs(id)` strictly? When a proposal is human-approved without a backing job (e.g. a user-originated UI mutation later), what goes here? Plan assumes it can be NULL.
-5. **`brief_shares` role names.** I assumed `viewer`/`reader` for read, `editor` for write — the actual role enum needs confirming. The existing `canReadBrief` / `canWriteBrief` helpers encapsulate this; using them avoids hardcoding role strings.
-6. **Idempotency window for `request_id`.** No expiration in lab. Re-evaluate before any production wiring.
-7. **Rate-limit budget.** 10/60s default is a guess. Calibrate after the first fake-Hermes burst.
-8. **TTL / GC for proposals + events.** Not in this milestone. Suggested 30-day sweep as a lab follow-up; production is dormant so no GC pressure.
-9. **The two demo routes.** Existing `/lab/canvas` (localStorage) stays; new `/lab/canvas/runtime` is server-backed. Confirm that's the desired final shape.
-10. **PR32 file paths** — every `[per brief]` claim in §1 must be spot-checked against the production repo by the implementer. If any path diverged after the brief was written, the plan needs a follow-up patch.
+- ~~Q1 `HermesCanvasSynthesisResponse` shape~~ — verified: today's shape does **not** carry canvas operations. Plan now requires an additive `canvas_actions?: HermesAction[]` field on both response types (§2.3).
+- ~~Q2 `hermes_job_events.event_type` constraint~~ — verified: column is free TEXT; constraint is in the TypeScript `HermesEventKind` union. Plan requires extending that union (§2.8.1, §3.4). No migration needed for this.
+- ~~Q3 `canvas_states.source` allowed values~~ — verified: `"deterministic" | "hermes" | "fake"`. Plan uses `"hermes"` for proposal-driven applies; provenance discrimination lives in `hermes_job_events.payload` (§3.3).
+- ~~Q4 `canvas_states.updated_by_job_id` nullability~~ — verified: `saveCanvasState()` accepts `jobId?: string | null`. Mark resolved (§3.3).
+- ~~Q5 share role names~~ — verified: user roles are `admin`/`member`/`viewer`; share roles are `reader`/`editor`. Plan uses `canReadBrief` / `canWriteBrief` helpers throughout and avoids hardcoding role strings (§2.9).
+- ~~Q10 PR32 file paths spot-check~~ — Hermes confirmed the paths in §1 against production main.
+
+Still open:
+
+1. **`HermesAction` promotion path.** Lab `web/lib/canvas/actions.ts` (on `hermes-lab/dynamic-canvas`) needs to land in production via `lib/canvas/contract.ts` before §4 implementation can begin; the gateway depends on `HermesAction` being a real production import. This is itself a small PR — not in this milestone.
+2. **`canvas_actions` typing in `HermesAction`.** When promoted, lab `HermesAction.fixture_only` is a lab-only marker. Production wire `canvas_actions` should drop that field (or treat it as informational). Spec the production-side `HermesAction` precisely when promoting.
+3. **Idempotency window for `request_id`.** No expiration in lab. Re-evaluate before any production wiring.
+4. **Rate-limit budget.** 10/60s default is a guess. Calibrate after the first fake-Hermes burst.
+5. **TTL / GC for proposals + events.** Not in this milestone. Suggested 30-day sweep as a lab follow-up; production is dormant so no GC pressure.
+6. **Two demo routes.** Existing `/lab/canvas` (localStorage) stays; new `/lab/canvas/runtime` is server-backed. Confirm that's the desired final shape.
+7. **"Ambiguous response" behavior.** §2.3 says when both `canvas` and `canvas_actions` are present, the gateway prefers `canvas_actions` and logs a `canvas_proposal.rejected` audit event. Confirm this is the desired triage signal rather than (a) preferring `canvas`, (b) hard-failing, or (c) silently using only `canvas_actions` without an audit.
 
 ---
 
 ## 10. Things deliberately NOT in this milestone
 
-- **No new wire types.** PR32's existing `HermesChatResponse` / `HermesCanvasSynthesisResponse` are the wire.
-- **No new audit table.** `hermes_job_events` is the audit.
-- **No `CANVAS_RUNTIME_*` envs.** Only PR32 envs plus one new fine-grained gate.
+- **No new wire envelope types.** PR32's existing `HermesChatResponse` / `HermesCanvasSynthesisResponse` are the wire. The only wire change is an additive optional field (`canvas_actions?: HermesAction[]`) on each.
+- **No new audit table.** `hermes_job_events` is the audit. `payload_json` is the carrier (not "metadata").
+- **No `CANVAS_RUNTIME_*` envs.** Only PR32 envs plus one new fine-grained gate (`HERMES_CANVAS_PROPOSALS_ENABLED`).
+- **No new write endpoint on `canvas-state`.** Existing GET-only route stays GET-only; writes go through the `saveCanvasState()` helper.
+- **No internal app-calls-itself HTTP route.** Adapters call the gateway module in-process.
 - **No sidecar endpoint changes.** The sidecar is unchanged.
 - **No production behavior change.** With flags off (production default), production routes are bit-for-bit identical.
 - **No public-share exposure.** `/s/[token]/*` is untouched.
