@@ -34,6 +34,21 @@ Everything in this plan is still **plan only**. No code, no migrations, no schem
 
 ---
 
+## 0.1 Implementation prerequisites (must be satisfied before §6/§7 code lands)
+
+This plan describes work that depends on the PR32 substrate landed on production main (`alindebergASL/account-research`). Codex CLI flagged that **the current lab repo `alindebergasl/account-research-hermes-lab` does not contain PR32 substrate** on any visible branch — there is no `web/lib/hermes/*`, no `web/scripts/hermes-runtime-service.ts`, no migration `012_brief_events` or `013_hermes_runtime_events_and_canvas_state`, and no `canvas_states` table. Attempting to implement migration `014` against this lab repo as-is would fail because the prerequisite migrations do not exist here.
+
+Before writing code, one of the following must be true:
+
+1. **Preferred:** the implementation branch is cut from `alindebergASL/account-research` `main` (production) which already contains PR32. The Track 2 work lands as a lab feature in that repo's `web/`, gated by `HERMES_CANVAS_PROPOSALS_ENABLED=0` in production envs. This is the only path that lets migration `014` reference `hermes_jobs`/`hermes_job_events`/`brief_events`/`canvas_states` as already-existing tables.
+2. **Alternative:** the PR32 substrate is first replicated into the lab repo by porting `web/lib/hermes/*`, `web/scripts/hermes-runtime-service.ts`, `ecosystem.hermes-lab.config.js`, `web/app/api/briefs/[id]/{canvas-state,hermes-events,hermes-events/stream}/route.ts`, and migrations `012`+`013` to a base branch in this lab repo (`hermes-lab/pr32-substrate` or similar). Migration `014` then lands on top of that. This path doubles the maintenance surface and is recommended only if there is an explicit reason not to do the work in production-main.
+
+**Migration `014` must not be implemented against a branch that lacks `canvas_states`, `hermes_jobs`, `hermes_job_events`, and `brief_events`.** The migration body references those tables for FK relationships, event dispatch, and `saveCanvasState()` calls; without them it cannot compile, and even if it could, it would create orphaned `canvas_proposals` rows.
+
+The plan author and reviewer should agree on path (1) vs (2) explicitly before §6/§7 work begins. Until then, this document remains plan-only.
+
+---
+
 ## 1. PR32 inventory (inherited from the prior plan)
 
 The PR32 facts established by Hermes review on the prior plan are unchanged and are inherited here. Summary (see the superseded plan for the full table):
@@ -194,7 +209,36 @@ Rationale lines are stored with the document so users can ask "why is this here?
 
 ### 2.8 Versioning
 
-`CanvasDocument.version` mirrors `canvas_states.version`. A `propose_refresh`-style full-document regeneration creates a new document with `version+1` and **a snapshot is recorded inside the corresponding `canvas_action_proposals` row** (per-proposal `canvas_before_json` / `canvas_after_json`) so undo is local to the proposal lifecycle. PR32's `canvas_states` is the canonical "current" pointer; history is reconstructable from proposals.
+`CanvasDocument.version` mirrors `canvas_states.version`. A `propose_refresh`-style full-document regeneration creates a new document with `version+1` and **a snapshot is recorded inside the corresponding `canvas_proposals` row** (per-proposal `canvas_before_json` / `canvas_after_json`) so undo is local to the proposal lifecycle. PR32's `canvas_states` is the canonical "current" pointer; history is reconstructable from proposals.
+
+### 2.9 Legacy `Canvas` compatibility (required)
+
+Production `canvas_states.canvas_json` today holds a **flat `Canvas` schema** (the PR32-era shape: account fields, widgets[], optional meta). The new `CanvasDocument` is a forward-compatible superset, but the gateway and renderer must keep dormant production behavior bit-for-bit unchanged while still letting the lab demo see real briefs as `CanvasDocument`. The plan therefore introduces three pure helpers:
+
+```ts
+// web/lib/canvas/legacy.ts (new)
+export function isCanvasDocument(raw: unknown): raw is CanvasDocument;
+export function isLegacyCanvas(raw: unknown): raw is LegacyCanvas;
+export function legacyCanvasToDocument(c: LegacyCanvas, briefId: string): CanvasDocument;
+```
+
+Rules:
+
+- **Read path** (load `canvas_states.canvas_json` for display):
+  1. `isCanvasDocument(raw)` → use as-is.
+  2. Else `isLegacyCanvas(raw)` → call `legacyCanvasToDocument(raw, briefId)` and use the result **in memory only**. Do not write the converted document back to `canvas_states`.
+  3. Else → render an empty placeholder and emit `hermes_job_events.canvas_proposal.rejected` with `payload.error_code = "unrecognized_canvas_state"`. No throw.
+- **Write path** (`saveCanvasState` from the gateway):
+  - If `HERMES_RUNTIME_ENABLED=1` AND `HERMES_CANVAS_PROPOSALS_ENABLED=1` AND the applied action produced a `CanvasDocument` → write a `CanvasDocument`.
+  - Otherwise → preserve PR32's existing behavior: write a flat `Canvas` (never a `CanvasDocument`). This guarantees that with the new flag off, production's `canvas_states.canvas_json` shape never changes.
+- **Conversion semantics (`legacyCanvasToDocument`):**
+  - One section is created per "intent" inferred from widget kind (e.g. `evidence_board` → `intent: "evidence"`). Sections that cannot be inferred fall back to `intent: "freeform"`.
+  - Each existing widget becomes a `kind: "widget"` `CanvasNode` with the same `id`, `widget_kind`, and data.
+  - No edges and no views are synthesized (we do not invent relationships that the legacy shape did not record).
+  - Provenance: `generated_by: { kind: "legacy_conversion", at: now() }`. Audited via a single `canvas_proposal.rejected`-class event? No — conversion is a read-time, no-op operation and emits **zero** events.
+  - The conversion is pure and deterministic; same input → byte-identical output.
+- **Sentinel:** the `CanvasDocument` schema includes `schema_version: 1`. A legacy `Canvas` lacks this field. `isCanvasDocument` checks `schema_version === 1`; `isLegacyCanvas` checks for the legacy-shape presence of `widgets: CanvasWidget[]` and the absence of `schema_version`. Anything else is unrecognized.
+- **Dormancy guarantee:** with the new flag(s) off, production code paths never reach `legacyCanvasToDocument` (because the new `/lab/canvas/runtime` UI is the only consumer of the conversion). PR32's existing `/canvas-state` route continues to return the legacy `Canvas` blob unchanged.
 
 ---
 
@@ -247,13 +291,20 @@ PrimitiveNode =
 
 #### 3.3.2 Renderer safety rules (non-negotiable)
 
-1. The primitive renderer is a fixed, source-controlled switch over the `p` discriminator. Any unknown `p` value → render nothing (and emit `canvas_proposal.rejected` audit with `payload.error_code = "unknown_primitive"`).
-2. All strings render as text, never as HTML. No `dangerouslySetInnerHTML`. No `eval`. No template-string interpolation to attributes.
-3. `link.href` is validated as a same-origin or `https://` URL by an allowlist function; anything else renders as plain text.
-4. No primitive accepts a function reference or a callback. `onClick` etc. are not in the schema.
-5. No primitive can include code (`script`, `style`, `iframe`, `object`, `embed` are unrepresentable in the schema).
-6. The primitive surface is rendered inside a CSP-safe sandboxed region of the canvas; even if a future primitive accepted a richer spec, browser-side CSP would block script-eval paths.
-7. Primitive specs MUST round-trip through `safeParse` at three boundaries: gateway intake, before render, and before write. A failure at any boundary surfaces as a `canvas_proposal.rejected` event with `payload.error_code = "primitive_schema_invalid"`.
+This is a **safe React primitive renderer**, **not an iframe sandbox**. The plan does not implement an `iframe sandbox` or rely on browser sandbox attributes. The safety guarantee is structural: the renderer dispatches on a closed enum, accepts only declarative JSON, and never opens an escape hatch to the DOM.
+
+1. The primitive renderer is a fixed, source-controlled `switch` over the `p` discriminator. Any unknown `p` value → render nothing (and emit `canvas_proposal.rejected` audit with `payload.error_code = "unknown_primitive"`).
+2. All strings render via React `{text}` (`textContent` semantics), never as HTML. `dangerouslySetInnerHTML` is banned throughout `web/components/canvas/**` (enforced by CI lint).
+3. `link.href` is validated by an allowlist function that accepts only `https://` URLs (or same-origin `/…` paths). Anything else renders as plain text.
+4. No primitive accepts a function reference or a callback. `onClick`, `onError`, etc. are not in the schema.
+5. No primitive can include code: `script`, `style`, `iframe`, `object`, `embed`, `link[rel=stylesheet]`, and similar are unrepresentable in the schema.
+6. Primitive specs MUST round-trip through `safeParse` at three boundaries: gateway intake, before render, and before write. A failure at any boundary surfaces as a `canvas_proposal.rejected` event with `payload.error_code = "primitive_schema_invalid"`.
+7. The renderer never imports modules dynamically. There is no `import(expr)`, no `new Function`, no `eval`. CI lint enforces this (§5).
+8. **Capability proposal viewer response hardening.** When a Layer-D capability proposal is fetched for display:
+   - The viewer endpoint returns `application/json` only — never `text/html`. Source text is delivered as a JSON string field, not embedded into an HTML page.
+   - Response headers include `X-Content-Type-Options: nosniff`. (`Content-Security-Policy` is a deployment-level concern; this plan does not assume a specific CSP, and the safety guarantee does not rely on one.)
+   - The viewer must require authentication (§7.2): `requireUser` + `canReadBrief(briefId)`.
+   - The browser viewer renders `ts_renderer_source` as `textContent` inside a `<pre>` element. Never via `dangerouslySetInnerHTML`. Never via a syntax-highlighter that constructs HTML; if highlighting is added later, it must produce nested `<span>` elements with hard-coded class names and `textContent`-only children.
 
 #### 3.3.3 Hermes verbs (Layer C)
 
@@ -302,9 +353,24 @@ WidgetCapabilityProposal = {
 
 #### 3.4.4 Hermes verbs (Layer D)
 
-- `capability.propose` — emits a `WidgetCapabilityProposal`. The proposal queue picks it up; canvas gets a `capability_placeholder` node.
-- `capability.withdraw` — Hermes-initiated retraction. Removes the placeholder, deletes the proposal row (audit retained).
-- `capability.register` — **does not exist as a Hermes action.** Registration is a human action, performed by merging source code, not via the runtime.
+- `capability.propose` — emits a `WidgetCapabilityProposal`. Effect: writes a `canvas_capability_proposals` row; emits `canvas_capability.proposed`. Does **not** by itself insert a node onto the canvas.
+- `capability.placeholder.create` — Layer-D node-insertion verb that places a `kind: "capability_placeholder"` `CanvasNode` onto the document, referencing an already-stored `capability_proposal_id`. **This is the only sanctioned path for creating a placeholder node.** It does not touch the `WidgetKind` registry and cannot be used to create a Layer-A widget.
+
+  ```ts
+  type CapabilityPlaceholderCreatePayload = {
+    capability_proposal_id: string;          // FK to canvas_capability_proposals.id
+    node_id: string;                         // ulid for the new CanvasNode
+    title: string;                           // displayed on the placeholder card
+    section_id?: string;                     // optional grouping
+    layout_hint?: { x?: number; y?: number; w?: number; h?: number };
+    rationale: string;
+  };
+  ```
+
+  The reducer validates that the referenced `capability_proposal_id` exists and is in status `"proposed"` or `"under_review"`. If not, rejects with `payload.error_code = "capability_proposal_missing"`.
+- `capability.placeholder.remove` — removes a placeholder node. Always requires approval. Does not by itself withdraw the underlying proposal; pair with `capability.withdraw` for full retraction.
+- `capability.withdraw` — Hermes-initiated retraction. Flips the `canvas_capability_proposals` row to `withdrawn`. **Does not** automatically remove placeholder nodes — the gateway synthesizes a paired `capability.placeholder.remove` for any placeholder that referenced it, which goes through the queue (approval required).
+- `capability.register` — **does not exist as a Hermes action.** Registration is a human action, performed by merging source code, not via the runtime. The DB row's `status = "promoted"` flag is set via the `mark-promoted` browser route (admin-only) after the human PR ships.
 
 ---
 
@@ -345,6 +411,8 @@ CanvasAction =
   // Layer D — capability proposals (lab-only, never executed)
   | { kind: "capability.propose"; payload: WidgetCapabilityProposal }
   | { kind: "capability.withdraw"; payload: { capability_proposal_id: string; reason: string } }
+  | { kind: "capability.placeholder.create"; payload: CapabilityPlaceholderCreatePayload }
+  | { kind: "capability.placeholder.remove"; payload: { node_id: string } }
 
   // Cross-layer evidence/decision verbs
   | { kind: "evidence.add"; payload: EvidenceOnNodePayload }
@@ -352,14 +420,39 @@ CanvasAction =
   | { kind: "hypothesis.add"; payload: HypothesisAddPayload }
   | { kind: "decision.add"; payload: DecisionAddPayload }
   | { kind: "action.add"; payload: NextActionAddPayload }
-  | { kind: "propose_refresh"; payload: ProposeRefreshPayload };  // unchanged from PR32 era
+  | { kind: "propose_refresh"; payload: ProposeRefreshPayload }   // unchanged from PR32 era
+
+  // Whole-document replace (used by the gateway when a response carries
+  // canvas_document but no canvas_actions). Always requires approval —
+  // never auto-applies because it replaces user-visible state wholesale.
+  | { kind: "document.replace"; payload: DocumentReplacePayload };
+
+// Whole-document replace payload
+type DocumentReplacePayload = {
+  next_document: CanvasDocument;     // validated CanvasDocument
+  prior_version: number;             // optimistic concurrency check vs canvas_states.version
+  preserve_node_ids?: string[];      // optional; if present, node ids in the list must survive the replace
+  rationale: string;                 // free-text; emitted into hermes_job_events.payload
+};
 ```
+
+`document.replace` is explicitly part of the typed union — not a synthetic gateway-internal kind. It validates, reduces, audits, and snapshots like any other action. Reducer pseudocode:
+
+```
+applyDocumentReplace(canvas, action):
+  if canvas.version !== action.payload.prior_version → reject "version_stale"
+  for each id in preserve_node_ids:
+    if next_document.nodes has no node with that id → reject "preserve_constraint_violated"
+  return next_document (with version+1, generated_at=now, generated_by=action.provenance)
+```
+
+Auto-apply policy: **`document.replace` never auto-applies.** Always queued for human approval, regardless of confidence or evidence. Rationale: it overwrites the entire user-visible workspace; a single human OK is the right gate.
 
 A single Hermes response can carry many `CanvasAction`s. They are applied in order; a failure mid-batch aborts the batch and records each applied prefix as auto-applied or queued, and the failing tail as failed (mirrors the prior plan's per-action semantics).
 
 **Allowlist by source** (gateway-enforced; one table):
-- `proposed_by = "hermes"`: all action families.
-- `proposed_by = "user"`: Layer A + Layer B (no `capability.propose` — capability proposals only originate from Hermes), no `propose_refresh`.
+- `proposed_by = "hermes"`: all action families, including `capability.propose`, `capability.placeholder.create`, `capability.placeholder.remove`, `capability.withdraw`, and `document.replace`.
+- `proposed_by = "user"`: Layer A + Layer B + `capability.placeholder.remove` (UI lets a user remove a placeholder they no longer want). **Not** `capability.propose`, `capability.placeholder.create`, `capability.withdraw`, `document.replace`, or `propose_refresh` — those originate from Hermes only.
 - `proposed_by = "system"`: `widget.mark_status`, `widget.add_evidence`, `rationale.add` only.
 
 ---
@@ -392,7 +485,8 @@ CREATE TABLE canvas_proposals (
   id                    TEXT PRIMARY KEY,           -- ulid
   brief_id              TEXT NOT NULL REFERENCES briefs(id) ON DELETE CASCADE,
   job_id                TEXT,                       -- hermes_jobs.id, when applicable
-  request_id            TEXT,                       -- caller-supplied envelope id (for idempotency)
+  request_id            TEXT,                       -- caller-supplied envelope id (one per response, may carry many actions)
+  request_action_index  INTEGER,                    -- 0-based index of this action within the response; null when request_id is null
   action_kind           TEXT NOT NULL,              -- one of CanvasAction.kind
   action_layer          TEXT NOT NULL,              -- "A" | "B" | "C" | "D"
   proposed_by           TEXT NOT NULL,              -- "hermes" | "user" | "system"
@@ -415,9 +509,15 @@ CREATE TABLE canvas_proposals (
 );
 
 CREATE INDEX idx_canvas_proposals_brief_status ON canvas_proposals(brief_id, status);
-CREATE INDEX idx_canvas_proposals_request ON canvas_proposals(request_id);
 CREATE INDEX idx_canvas_proposals_job ON canvas_proposals(job_id);
 CREATE INDEX idx_canvas_proposals_layer ON canvas_proposals(action_layer);
+
+-- Idempotency: a (brief, request, action-index) tuple uniquely identifies one
+-- gateway ingestion attempt. The partial WHERE clause keeps user/system actions
+-- (which carry no request_id) out of the uniqueness check.
+CREATE UNIQUE INDEX idx_canvas_proposals_request_unique
+  ON canvas_proposals(brief_id, request_id, request_action_index)
+  WHERE request_id IS NOT NULL;
 
 -- Layer D — capability proposals (lab-only)
 CREATE TABLE canvas_capability_proposals (
@@ -520,11 +620,26 @@ Gateway interpretation order on a single response:
 1. If `canvas_actions` is present and non-empty → run the proposal lifecycle per-action. **Authoritative.**
 2. Else if `canvas_document` is present → treat as a full-document replace proposal (single proposal row with `action_kind = "document.replace"`, snapshot semantics same as a regular apply).
 3. Else if `canvas` (legacy) is present → preserve PR32's legacy behavior: write `canvas_states` directly with `source: "hermes"`, no proposal row, no `canvas_proposal.*` events.
-4. `widget_capability_proposals` is processed *in parallel* (always lab-only-gated) — for each, write a `canvas_capability_proposals` row, emit `canvas_capability.proposed`, optionally insert a `capability_placeholder` node into the document via a `widget.create` action with `kind: "capability_placeholder"`.
+4. `widget_capability_proposals` is processed *in parallel* (always lab-only-gated). For each proposal the gateway:
+   - writes a `canvas_capability_proposals` row,
+   - emits `canvas_capability.proposed`,
+   - and, if the gateway is configured to surface placeholders on canvas, **synthesizes an additional `capability.placeholder.create` action** (Layer D) which goes through the same proposal lifecycle as any other action.
+
+The placeholder is **never** created via `widget.create`. `widget.create` operates on the closed source-controlled `WidgetKind` registry; `capability_placeholder` is a `CanvasNode.kind` value, not a registered `WidgetKind`, and the renderer routes it through a separate Layer-D code path. This preserves the invariant that `widget.create` payload's `widget_kind` is always a member of the registered `WidgetKind` enum.
 
 Ambiguity is **audited but resolved deterministically**: if a response carries both `canvas_actions` and `canvas_document`, the gateway prefers `canvas_actions` and emits `canvas_proposal.rejected` with `payload.error_code = "ambiguous_canvas_document_and_actions"`. Same pattern as the prior plan's `canvas` vs `canvas_actions` ambiguity (now extended).
 
 **No `RuntimeRequest` / `RuntimeResponse` types** — additive optional fields only.
+
+### 6.5.1 Idempotency
+
+A Hermes response is identified by `request_id` (carried in `HermesChatResponse.events` / `HermesCanvasSynthesisResponse.events` metadata, or supplied by the caller). A single response can carry many `canvas_actions`; each gets a stable `request_action_index = 0…n-1`. The gateway enforces idempotency via the partial unique index on `(brief_id, request_id, request_action_index)`:
+
+- **First ingest** of `(brief_id, request_id, request_action_index = 0)` → row inserted normally.
+- **Duplicate ingest** of the same triple → the gateway `safeParse`-validates as usual, then attempts the insert, catches the unique-constraint violation, and returns the existing `proposal_id` to the caller. **No second row created. No second `hermes_job_events` row created.** One audit event is appended on the duplicate: `kind: "canvas_proposal.rejected"`, `payload: { error_code: "duplicate_request", proposal_id, request_id, request_action_index }`. This single duplicate-marker event is the **only** exception to the "exactly one audit per gateway decision" invariant — the duplicate ingest is not a fresh decision, so we record the duplicate-detection event but never the original decision again.
+- **Same `request_id` with a different `request_action_index`** is **not** a duplicate; it is a distinct action within the same response.
+- Actions without a `request_id` (e.g. user-originated UI mutations) are **not** subject to idempotency; each call creates a fresh proposal. UI is expected to debounce client-side.
+- The unique index uses `WHERE request_id IS NOT NULL` so user/system inserts (which leave `request_id` NULL) do not contend with the index.
 
 ---
 
@@ -598,7 +713,25 @@ Two new flags. Both default off. Production deploys leave them unset.
 
 ## 8. UI / lab demo plan
 
-`/lab/canvas/runtime?briefId=<id>` — server-backed generative canvas. Minimal styling.
+`/lab/canvas/runtime` — server-backed generative canvas demo. Minimal styling.
+
+### 8.0 Auth posture (must be settled before any real-brief read path)
+
+The current lab `/lab` middleware entry treats `/lab` as a public path (introduced for fixture-only demos on `hermes-lab/dynamic-canvas`). That is **incompatible with reading real brief data**. The plan requires one of these two postures, chosen at implementation time and documented in the page:
+
+- **A. Authenticated mode (required if the page accepts a `?briefId=<id>`):**
+  - The route requires `requireUser` middleware.
+  - Every server-side load checks `canReadBrief(briefId)`; mutation routes additionally enforce `canWriteBrief`.
+  - The `/lab` PUBLIC_PATHS entry is **either removed for `/lab/canvas/runtime` specifically (preferred)** or the page itself short-circuits to a login redirect when no session is present.
+  - The capability viewer endpoint also requires `requireUser` + `canReadBrief` and returns `application/json` only.
+- **B. Fixture-only mode (only path that may stay unauthenticated):**
+  - No `?briefId` parameter accepted. Path is `/lab/canvas/runtime/fixture` (or the page ignores any provided briefId).
+  - No database reads. The page is hydrated from a JS-bundled fixture only.
+  - No mutations possible (`HERMES_CANVAS_PROPOSALS_ENABLED` is irrelevant on this variant).
+
+The plan picks **A as the default for the named demo route `/lab/canvas/runtime?briefId=<id>`**, with B available as a separate route for offline demos. Authenticated mode is required for everything in §8.1–§8.3 because they assume real brief, proposal, and event data.
+
+The middleware change is small: remove the blanket `/lab` PUBLIC_PATHS entry, or replace it with a narrower `/lab/fixture` entry. Either way, the authenticated route is the only path that touches the gateway.
 
 ### 8.1 Page sections
 
@@ -649,7 +782,10 @@ No animations beyond what already exists, no themes, no drag handles for freefor
 | `tests/canvas.reducer.layerB.test.ts` | move/resize/group/edge/section/view/layout — all preserve invariants (referential integrity of `node_ids`, `from`/`to`, etc.). Removing a node cascades to edges and view membership. |
 | `tests/canvas.reducer.layerC.test.ts` | primitive_surface create/update — spec validates before write; remove. |
 | `tests/canvas.reducer.layerD.test.ts` | capability.propose creates row + placeholder node; capability.withdraw removes both; mark-promoted (manual) flips status and triggers a follow-up widget.create. |
-| `tests/canvas.reducer.document_replace.test.ts` | `document.replace` snapshot/undo round-trip. |
+| `tests/canvas.reducer.document_replace.test.ts` | `document.replace` is in the typed union; validates `prior_version`; rejects `version_stale`; honors `preserve_node_ids`; snapshot/undo round-trip; never auto-applies. |
+| `tests/canvas.reducer.capability_placeholder.test.ts` | `capability.placeholder.create` inserts a `kind: "capability_placeholder"` node referencing an existing `canvas_capability_proposals.id`. **Asserts the node is NOT created via `widget.create` and that `widget.create` rejects `widget_kind: "capability_placeholder"`** (closed `WidgetKind` enum). Placeholder removal via `capability.placeholder.remove` requires approval. |
+| `tests/canvas.legacy.conversion.test.ts` | `isCanvasDocument` / `isLegacyCanvas` / `legacyCanvasToDocument` round-trip. Same input → byte-identical output. A `Canvas` with no `schema_version` converts; a `CanvasDocument` passes through unchanged; an unrecognized shape produces a `canvas_proposal.rejected` audit with `payload.error_code = "unrecognized_canvas_state"` and no throw. |
+| `tests/canvas.gateway.idempotency.test.ts` | Duplicate ingest of `(brief_id, request_id, request_action_index)` returns the existing `proposal_id` and appends exactly one `canvas_proposal.rejected` event with `payload.error_code = "duplicate_request"`. No duplicate `canvas_proposals` row. Same `request_id` with different `request_action_index` is **not** a duplicate. NULL `request_id` rows do not contend with the unique index. |
 
 ### 9.3 Primitive renderer safety tests
 
@@ -658,6 +794,12 @@ No animations beyond what already exists, no themes, no drag handles for freefor
 | `tests/canvas.primitive.schema.test.ts` | Every primitive `p` value parses; unknown `p` rejected. |
 | `tests/canvas.primitive.render.safety.test.ts` | Renderer never produces a `<script>`, never sets `innerHTML`, never assigns to a function-typed prop. Property-based tests over random valid specs assert no escape. Links with non-https/non-same-origin hrefs render as text. |
 
+### 9.3.1 Route auth tests
+
+| File (new) | Cases |
+|---|---|
+| `tests/canvas.route.auth.test.ts` | Unauthenticated `GET /lab/canvas/runtime?briefId=<id>` returns redirect-to-login (Option A authenticated mode). Authenticated user without `canReadBrief` on the requested brief gets 403. Authenticated `reader` cannot hit approve/reject (403). The `/lab/canvas/runtime/fixture` variant (Option B) responds 200 with no DB read and a bundled-fixture body, regardless of session presence. |
+
 ### 9.4 Generated-widget non-execution tests
 
 | File (new) | Cases |
@@ -665,7 +807,7 @@ No animations beyond what already exists, no themes, no drag handles for freefor
 | `tests/canvas.capability.no_execution.test.ts` | Round-trip a `WidgetCapabilityProposal.ts_renderer_source` containing payload like `globalThis.__pwned = true` and assert that after gateway ingestion, render of the placeholder, and viewer mount, `globalThis.__pwned` is undefined. |
 | `tests/canvas.capability.no_dynamic_import.test.ts` | Lint/grep gate: grep the gateway + renderer + viewer source for `eval(`, `new Function(`, `import(<expr>)`, `require(<expr>)`. Fail the test if matched. |
 | `tests/canvas.capability.size_cap.test.ts` | `ts_renderer_source` > 50 KB → `payload.error_code = "ts_renderer_source_too_large"`. |
-| `tests/canvas.capability.viewer_pre_only.test.ts` | The proposal viewer renders source as a `<pre>` with text content; assert via snapshot that no `<script>`/`<style>`/`<iframe>` is emitted. |
+| `tests/canvas.capability.viewer_pre_only.test.ts` | The proposal viewer renders source as a `<pre>` with text content; assert via snapshot that no `<script>`/`<style>`/`<iframe>` is emitted. Viewer response is `Content-Type: application/json` and includes `X-Content-Type-Options: nosniff`. Source field is delivered as a JSON string; the browser-side viewer uses `textContent` only. |
 
 ### 9.5 Audit invariant tests
 
@@ -726,6 +868,11 @@ The implementation milestone is done when **all** of the following hold:
 | Layout `view` is a saved lens, not a separate document | **Yes** | Avoids document explosion. |
 | Auto-apply for Layer B (layout/sections/edges) | **Yes for additive; no for removes** | Keeps the demo flowing; destructive layout changes still gate. |
 | Capability `mark-promoted` requires user-role admin | **Yes** | Reflects that promotion is a code/release decision, not a brief-edit decision. |
+| `document.replace` typed as a first-class `CanvasAction` | **Yes** | Gateway-internal "kind strings" are a code smell. Reducer validates + audits it like any other action; never auto-applies. |
+| Placeholder insertion via `capability.placeholder.create` (Layer D) instead of `widget.create` | **Yes** | Preserves the closed `WidgetKind` enum invariant. `widget.create` only ever creates registered widgets. |
+| Legacy `Canvas` ⇄ `CanvasDocument` conversion at read time | **Yes** | Lets the lab demo see real briefs as documents without ever writing a `CanvasDocument` into `canvas_states` when proposals are disabled. Dormant production behavior is byte-identical. |
+| Idempotency via partial-unique `(brief_id, request_id, request_action_index)` | **Yes** | Cheap, declarative, lets duplicates fail at the DB layer. UI-originated mutations stay out of the contention path. |
+| Safe primitive renderer vs. iframe sandbox | **Safe renderer** | Structural safety (closed enum, no `dangerouslySetInnerHTML`, no functions on the wire) beats an iframe whose escape surface still depends on browser-side bugs. Viewer endpoint adds `nosniff` + JSON-only response. |
 
 ---
 
