@@ -1,10 +1,17 @@
 # Canvas Runtime Contract + Audit Rails — Lab Implementation Plan (PR32-aligned)
 
+> **SUPERSEDED.** This narrow plan has been replaced by
+> `docs/plans/2026-05-19-generative-canvas-runtime-audit-rails-pr32-aligned.md`
+> (generative-canvas reframing). The PR32 alignment facts in §1, §2.3, §2.8.1,
+> §3, and §4 are still accurate and are inherited by the successor plan. The
+> narrow fixed-action framing is retired.
+
 Status: **PLAN ONLY**. Lab-only. Do not deploy. Do not modify production code as part of executing this plan.
 Date: 2026-05-19
 Author: Track 2 lab agent
 Plan branch: `lab/canvas-runtime-contract-plan` (this revision lives alongside the original)
 Supersedes: `docs/plans/2026-05-15-canvas-runtime-contract-audit-rails.md` (original 2026-05-15 plan; left in tree for traceability)
+Superseded by: `docs/plans/2026-05-19-generative-canvas-runtime-audit-rails-pr32-aligned.md` (generative reframing, same date)
 Production target: `alindebergASL/account-research` `main` (head includes `2afadeb feat: add lab Hermes runtime service (#32)`)
 
 ---
